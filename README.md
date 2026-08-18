@@ -6,10 +6,11 @@ A Gradio web app for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) text-to-sp
 
 - **Preset voices** - 9 built-in voices with style instruction control
 - **Voice design** - Create custom voices from text descriptions
-- **Voice cloning** - Clone voices from short reference audio clips (M4A, MP3, WAV)
+- **Voice cloning** - Clone voices from short reference audio clips (M4A, MP3, WAV), with delete support for saved voices
 - **Model management** - Download and delete models from the UI
 - **Generation history** - 5 recent outputs with waveform playback, inline rename, and delete
 - **REST API** - Built-in FastAPI endpoints for programmatic access (same process as the UI)
+- **OpenAI-compatible API** - Drop-in `POST /v1/audio/speech` for OpenAI SDKs and clients
 
 ## Requirements
 
@@ -45,10 +46,13 @@ On first use, go to the **Models** tab and download at least one model. The 1.7B
 |--------|------|-------------|
 | `GET` | `/v1/health` | Health check |
 | `GET` | `/v1/voices` | List preset and saved voices |
+| `DELETE` | `/v1/voices/{name}` | Delete a saved voice |
 | `GET` | `/v1/models` | List models and download status |
 | `POST` | `/v1/tts/generate` | Generate with preset voice |
 | `POST` | `/v1/tts/design` | Generate with voice design |
 | `POST` | `/v1/tts/clone` | Generate with saved voice |
+| `POST` | `/v1/audio/speech` | OpenAI-compatible speech synthesis |
+| `POST` | `/v1/audio/transcriptions` | OpenAI-compatible speech-to-text (local Whisper) |
 
 ### Examples
 
@@ -82,7 +86,77 @@ curl -X POST http://localhost:7860/v1/tts/clone \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello world", "voice": "my_saved_voice"}' \
   --output cloned.wav
+
+# Delete a saved voice
+curl -X DELETE http://localhost:7860/v1/voices/my_saved_voice
 ```
+
+## OpenAI-Compatible API
+
+`POST /v1/audio/speech` follows the [OpenAI audio/speech API](https://platform.openai.com/docs/api-reference/audio/createSpeech), so existing SDKs work by changing `base_url`:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:7860/v1", api_key="not-needed")
+response = client.audio.speech.create(
+    model="tts-1",
+    voice="alloy",
+    input="Hello from local Qwen3-TTS!",
+)
+response.stream_to_file("hello.mp3")
+```
+
+```bash
+curl -X POST http://localhost:7860/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"model": "tts-1", "input": "Hello world", "voice": "alloy"}' \
+  --output hello.mp3
+```
+
+`GET /v1/models` also returns the OpenAI list shape alongside the native one.
+
+### Speech-to-text
+
+`POST /v1/audio/transcriptions` accepts a multipart audio upload (any format `ffmpeg` decodes — browser webm/opus, mp3, wav, m4a, ...) and transcribes it with a local MLX Whisper model:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:7860/v1", api_key="not-needed")
+with open("speech.mp3", "rb") as f:
+    result = client.audio.transcriptions.create(model="whisper-1", file=f)
+print(result.text)
+```
+
+```bash
+curl -X POST http://localhost:7860/v1/audio/transcriptions \
+  -F "file=@speech.mp3" \
+  -F "model=whisper-1"
+# {"text": "..."}
+```
+
+| Field | Behavior |
+|-------|----------|
+| `model` | `whisper-1` (alias for the default) or a local model: `whisper-turbo` (default, ~1.6 GB), `whisper-large-v3-turbo`, `whisper-large-v3`, `whisper-small`, `whisper-base` |
+| `language` | Optional ISO code (`zh`, `en`, ...); omit for auto-detect |
+| `file` | Audio upload, 25 MB max, JSON response `{"text": ...}` |
+
+Whisper weights download from HuggingFace on first use (the first call is slow); the model then stays resident like the TTS models. Requires `ffmpeg` on PATH for non-WAV formats.
+
+### Request mapping
+
+| OpenAI field | Behavior |
+|--------------|----------|
+| `model` | `tts-1` / `tts-1-hd` / `gpt-4o-mini-tts`, or a local model name (`1.7B-CustomVoice`, `1.7B-Base`, `0.6B-Base`, ...) to pick the backend |
+| `input` | Text to synthesize (max 4096 chars) |
+| `voice` | Resolution order: **saved voice** (exact name) → **preset voice** (`Ryan`, `Serena`, ...) → **OpenAI alias** (`alloy`, `echo`, `nova`, ...) → `"design"` or empty for voice design |
+| `instructions` | Style instruction for preset voices; voice description when `voice` is `design` |
+| `response_format` | `mp3` (default), `wav`, `flac`, `opus`, or `pcm` (16-bit LE 24 kHz). `aac` is not supported |
+| `speed` | 0.25–4.0, pitch-preserving time stretch |
+| `language` | Used by voice design (`Auto` by default) |
+
+Differences from OpenAI: no authentication (any `Authorization` header is ignored), `stream` is accepted but audio arrives in a single body, and errors use the OpenAI error JSON shape.
 
 ## Models
 

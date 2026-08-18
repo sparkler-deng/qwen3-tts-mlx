@@ -1,14 +1,22 @@
 """Gradio web app + REST API for Qwen3-TTS on Apple Silicon."""
 
 import argparse
+import io
 import json
+import os
 import shutil
+import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
 import gradio as gr
-from fastapi import HTTPException
-from fastapi.responses import FileResponse
+import librosa
+import mlx_whisper
+import numpy as np
+import soundfile as sf
+from fastapi import File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response
 from huggingface_hub import scan_cache_dir, snapshot_download
 from pydantic import BaseModel, Field
 
@@ -20,6 +28,7 @@ from tts import (
     CLONE_MODELS,
     LANGUAGES,
     SAVED_VOICES_DIR,
+    _lock,
     get_model_status,
     load_saved_voices,
     generate_preset_audio,
@@ -40,6 +49,99 @@ VOICE_DESIGN_PRESETS = [
     "calm professional news anchor, clear and authoritative",
     "friendly storyteller, expressive with gentle warmth",
 ]
+
+# OpenAI speech-API voice names → closest local preset voice.
+OPENAI_VOICE_ALIASES = {
+    "alloy": "Aiden",
+    "ash": "Ryan",
+    "ballad": "Serena",
+    "coral": "Vivian",
+    "echo": "Ryan",
+    "fable": "Serena",
+    "nova": "Vivian",
+    "onyx": "Uncle_Fu",
+    "sage": "Sohee",
+    "shimmer": "Sohee",
+    "verse": "Dylan",
+}
+
+OPENAI_MODEL_ALIASES = {"tts-1", "tts-1-hd", "gpt-4o-mini-tts"}
+
+# response_format → (soundfile format, subtype, media type). "pcm" is handled
+# separately as raw 16-bit little-endian samples.
+SPEECH_FORMATS = {
+    "mp3": ("MP3", None, "audio/mpeg"),
+    "wav": ("WAV", "PCM_16", "audio/wav"),
+    "flac": ("FLAC", "PCM_16", "audio/flac"),
+    "opus": ("OGG", "OPUS", "audio/ogg"),
+    "pcm": (None, None, "audio/pcm"),
+}
+
+# Local Whisper STT models (name → HF repo) for /v1/audio/transcriptions.
+# The model auto-downloads on first use and stays resident (mlx_whisper keeps
+# a single cached model, swapped like the TTS side).
+STT_MODELS = {
+    "whisper-turbo": "mlx-community/whisper-turbo",
+    "whisper-large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+    "whisper-large-v3": "mlx-community/whisper-large-v3-mlx",
+    "whisper-small": "mlx-community/whisper-small-mlx",
+    "whisper-base": "mlx-community/whisper-base-mlx",
+}
+DEFAULT_STT_MODEL = "whisper-turbo"
+
+# OpenAI transcription model names accepted as the local default.
+STT_MODEL_ALIASES = {"whisper-1", "gpt-4o-transcribe", "gpt-4o-mini-transcribe"}
+
+# Match DeepTutor / OpenAI clients: audio uploads are capped at 25 MB.
+MAX_STT_FILE_BYTES = 25 * 1024 * 1024
+
+
+def find_preset_voice(name: str) -> str | None:
+    """Return the full preset label matching a voice name, case-insensitive."""
+    wanted = name.strip().lower()
+    for v in VOICES:
+        if v.lower() == wanted or v.split(" (")[0].lower() == wanted:
+            return v
+    return None
+
+
+def openai_error(status: int, message: str, err_type: str = "invalid_request_error", code: str | None = None):
+    """Build an OpenAI-style error response."""
+    return JSONResponse(
+        status_code=status,
+        content={"error": {"message": message, "type": err_type, "param": None, "code": code}},
+    )
+
+
+def encode_speech_audio(audio: np.ndarray, response_format: str) -> tuple[bytes, str]:
+    """Encode float mono 24 kHz audio for an OpenAI speech response_format."""
+    if response_format == "pcm":
+        pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2")
+        return pcm.tobytes(), "audio/pcm"
+    sf_format, subtype, media_type = SPEECH_FORMATS[response_format]
+    buf = io.BytesIO()
+    if subtype:
+        sf.write(buf, audio, 24000, format=sf_format, subtype=subtype)
+    else:
+        sf.write(buf, audio, 24000, format=sf_format)
+    return buf.getvalue(), media_type
+
+
+def transcribe_audio_file(audio_path: str, model_name: str, language: str | None) -> str:
+    """Transcribe an audio file with the local Whisper model.
+
+    Shares the TTS generation lock so GPU memory is only used by one model
+    pass at a time.
+    """
+    repo = STT_MODELS.get(model_name, STT_MODELS[DEFAULT_STT_MODEL])
+    kwargs = {}
+    if language and language.strip().lower() not in ("", "auto"):
+        kwargs["language"] = language.strip()
+    with _lock:
+        result = mlx_whisper.transcribe(audio_path, path_or_hf_repo=repo, **kwargs)
+    if isinstance(result, dict):
+        return (result.get("text") or "").strip()
+    return str(getattr(result, "text", "")).strip()
 
 
 def download_model(repo_id: str) -> str:
@@ -117,6 +219,14 @@ def save_designed_voice(audio_path: str, transcript: str, instruct: str, name: s
     }))
 
     return safe_name
+
+
+def delete_saved_voice(name: str) -> str:
+    """Delete a saved voice directory from saved_voices/."""
+    if name not in load_saved_voices():
+        raise gr.Error(f"Voice '{name}' not found")
+    shutil.rmtree(SAVED_VOICES_DIR / name)
+    return name
 
 
 def rename_generation(history: list, index: int, new_name: str) -> list:
@@ -413,11 +523,21 @@ with gr.Blocks(title="Qwen3-TTS") as app:
                         elem_classes=["compact-input"],
                     )
 
-                    saved_voice_dropdown = gr.Dropdown(
-                        choices=get_saved_voice_choices(),
-                        label="Voice",
-                        interactive=True,
-                    )
+                    with gr.Row():
+                        saved_voice_dropdown = gr.Dropdown(
+                            choices=get_saved_voice_choices(),
+                            label="Voice",
+                            interactive=True,
+                            scale=4,
+                        )
+                        refresh_voice_btn = gr.Button(
+                            "↻", scale=0, size="sm",
+                            elem_classes=["icon-btn"],
+                        )
+                        delete_voice_btn = gr.Button(
+                            "🗑️", variant="stop", scale=0, size="sm",
+                            elem_classes=["icon-btn"],
+                        )
 
                     clone_model = gr.Dropdown(
                         choices=list(CLONE_MODELS.keys()),
@@ -563,6 +683,13 @@ with gr.Blocks(title="Qwen3-TTS") as app:
         gr.Info(f"Voice '{safe_name}' saved")
         return gr.update(choices=new_choices, value=safe_name)
 
+    def do_delete_voice(saved_voice):
+        if not saved_voice:
+            raise gr.Error("Please select a voice to delete")
+        delete_saved_voice(saved_voice)
+        gr.Info(f"Voice '{saved_voice}' deleted")
+        return gr.update(choices=get_saved_voice_choices(), value=None)
+
     def do_refresh_voices():
         return gr.update(choices=get_saved_voice_choices())
 
@@ -571,6 +698,12 @@ with gr.Blocks(title="Qwen3-TTS") as app:
 
     # JavaScript to reset audio seek position
     reset_audio_js = "() => { document.querySelectorAll('audio').forEach(a => { a.currentTime = 0; a.pause(); }); }"
+
+    # In gradio 6, a js callback's return value IS the event payload sent to
+    # the server, so it must pass the (single) input value through. Returning
+    # nothing would send null inputs; throwing cancels the event.
+    def confirm_js(msg: str) -> str:
+        return f"(v) => {{ if (!confirm('{msg}')) throw new Error('cancelled'); return [v]; }}"
 
     # Chain: first shift history (instant), then generate (slow, only updates slot 0), then reset audio
     preset_btn.click(
@@ -634,7 +767,7 @@ with gr.Blocks(title="Qwen3-TTS") as app:
             fn=make_delete_handler(i),
             inputs=[history_state],
             outputs=[history_state] + all_slot_outputs,
-            js="() => confirm('Delete this audio file from disk?')",
+            js=confirm_js("Delete this audio file from disk?"),
         )
 
     create_voice_btn.click(
@@ -647,6 +780,18 @@ with gr.Blocks(title="Qwen3-TTS") as app:
         fn=do_save_designed_voice,
         inputs=[design_last_state, design_save_name],
         outputs=[saved_voice_dropdown],
+    )
+
+    refresh_voice_btn.click(
+        fn=do_refresh_voices,
+        outputs=[saved_voice_dropdown],
+    )
+
+    delete_voice_btn.click(
+        fn=do_delete_voice,
+        inputs=[saved_voice_dropdown],
+        outputs=[saved_voice_dropdown],
+        js=confirm_js("Delete this saved voice? This cannot be undone."),
     )
 
     # Model management handlers
@@ -684,7 +829,7 @@ with gr.Blocks(title="Qwen3-TTS") as app:
         fn=do_delete_model,
         inputs=[model_selector],
         outputs=[model_output, model_status_display],
-        js="() => confirm('Delete this model from cache? You will need to re-download it to use again.')",
+        js=confirm_js("Delete this model from cache? You will need to re-download it to use again."),
     )
 
 # --- REST API (registered on Gradio's FastAPI instance) ---
@@ -713,6 +858,19 @@ class CloneRequest(BaseModel):
     model: str = list(CLONE_MODELS.keys())[0]
 
 
+class SpeechRequest(BaseModel):
+    """OpenAI /v1/audio/speech request body."""
+
+    model: str = "tts-1"
+    input: str
+    voice: str = ""
+    instructions: str = ""
+    response_format: str = "mp3"
+    speed: float = Field(default=1.0, ge=0.25, le=4.0)
+    language: str = "Auto"
+    stream: bool = False  # accepted for compatibility; audio arrives in one body
+
+
 def register_api(fastapi_app):
     """Register the /v1/* REST routes on the served FastAPI instance."""
 
@@ -726,9 +884,25 @@ def register_api(fastapi_app):
         saved = list(load_saved_voices().keys())
         return {"preset": preset, "saved": saved}
 
+    @fastapi_app.delete("/v1/voices/{voice_name}")
+    def api_delete_voice(voice_name: str):
+        if voice_name not in load_saved_voices():
+            raise HTTPException(status_code=404, detail=f"Voice '{voice_name}' not found")
+        shutil.rmtree(SAVED_VOICES_DIR / voice_name)
+        return {"deleted": voice_name}
+
     @fastapi_app.get("/v1/models")
     def api_list_models():
-        return {"models": get_model_status()}
+        statuses = get_model_status()
+        return {
+            "models": statuses,
+            # OpenAI-compatible listing (same response, both shapes).
+            "object": "list",
+            "data": [
+                {"id": s["name"], "object": "model", "created": int(time.time()), "owned_by": "mlx-community"}
+                for s in statuses
+            ],
+        }
 
     @fastapi_app.post("/v1/tts/generate")
     def api_generate_preset(req: PresetRequest):
@@ -768,6 +942,118 @@ def register_api(fastapi_app):
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e))
         return FileResponse(metadata["path"], media_type="audio/wav", filename=metadata["filename"])
+
+    @fastapi_app.post("/v1/audio/speech")
+    def api_create_speech(req: SpeechRequest):
+        """OpenAI-compatible text-to-speech.
+
+        Voice resolution order: saved voices, local preset voices,
+        OpenAI voice aliases, or "design"/empty for voice design via
+        `instructions`.
+        """
+        fmt = req.response_format.lower()
+        if fmt not in SPEECH_FORMATS:
+            return openai_error(400, f"response_format must be one of: {', '.join(sorted(SPEECH_FORMATS))}")
+        if not req.input.strip():
+            return openai_error(400, "input is required")
+        if len(req.input) > 4096:
+            return openai_error(400, "input must be 4096 characters or less")
+        if req.model not in OPENAI_MODEL_ALIASES and req.model not in ALL_MODELS:
+            return openai_error(400, f"The model '{req.model}' does not exist", code="model_not_found")
+
+        voice = req.voice.strip()
+        saved = load_saved_voices()
+        use_design = voice.lower() in ("", "design")
+        preset = None if use_design or voice in saved else find_preset_voice(
+            OPENAI_VOICE_ALIASES.get(voice.lower(), voice)
+        )
+
+        if not (voice in saved or preset or use_design):
+            names = [v.split(" (")[0] for v in VOICES]
+            return openai_error(
+                400,
+                f"Voice '{voice}' not found. Use a preset ({', '.join(names)}), "
+                f"an OpenAI alias ({', '.join(sorted(OPENAI_VOICE_ALIASES))}), "
+                f"a saved voice ({', '.join(saved) or 'none yet'}), or 'design'.",
+                code="voice_not_found",
+            )
+
+        try:
+            if voice in saved:
+                if req.model not in OPENAI_MODEL_ALIASES and req.model not in CLONE_MODELS:
+                    return openai_error(400, f"Model '{req.model}' cannot clone voices; use {', '.join(CLONE_MODELS)}")
+                model_name = req.model if req.model in CLONE_MODELS else "1.7B-Base"
+                audio, _metadata = generate_clone_audio(
+                    text=req.input, saved_voice=voice, temperature=1.0, model_name=model_name,
+                )
+            elif use_design:
+                if req.model not in OPENAI_MODEL_ALIASES and req.model != "1.7B-VoiceDesign":
+                    return openai_error(400, "Model '" + req.model + "' cannot design voices; use 1.7B-VoiceDesign")
+                if not req.instructions.strip():
+                    return openai_error(400, "instructions (a voice description) are required when voice is 'design'")
+                audio, _metadata = generate_design_audio(
+                    text=req.input, instruct=req.instructions,
+                    language=req.language, temperature=0.9,
+                )
+            else:
+                if req.model not in OPENAI_MODEL_ALIASES and req.model != "1.7B-CustomVoice":
+                    return openai_error(400, f"Model '{req.model}' cannot use preset voices; use 1.7B-CustomVoice")
+                audio, _metadata = generate_preset_audio(
+                    text=req.input, voice=preset, instruct=req.instructions,
+                    temperature=1.0, model_name="1.7B-CustomVoice",
+                )
+        except ValueError as e:
+            return openai_error(400, str(e))
+        except RuntimeError as e:
+            return openai_error(503, str(e), err_type="service_unavailable")
+
+        audio = np.asarray(audio, dtype=np.float32)
+        if req.speed != 1.0:
+            audio = librosa.effects.time_stretch(audio, rate=req.speed)
+        data, media_type = encode_speech_audio(audio, fmt)
+        return Response(content=data, media_type=media_type)
+
+    @fastapi_app.post("/v1/audio/transcriptions")
+    def api_transcribe_audio(
+        file: UploadFile = File(...),
+        model: str = Form("whisper-1"),
+        language: str | None = Form(None),
+    ):
+        """OpenAI-compatible speech-to-text using local Whisper models.
+
+        Accepts multipart uploads (any format ffmpeg can decode — webm/opus
+        from browsers, mp3, wav, m4a, ...) and returns `{"text": ...}`.
+        The model downloads on first use.
+        """
+        model = (model or "").strip() or "whisper-1"
+        if model not in STT_MODEL_ALIASES and model not in STT_MODELS:
+            return openai_error(
+                400, f"The model '{model}' does not exist", code="model_not_found"
+            )
+        model_name = model if model in STT_MODELS else DEFAULT_STT_MODEL
+
+        suffix = Path(file.filename or "audio.webm").suffix or ".webm"
+        try:
+            data = file.file.read()
+        finally:
+            file.file.close()
+        if not data:
+            return openai_error(400, "file is required")
+        if len(data) > MAX_STT_FILE_BYTES:
+            return openai_error(413, "file exceeds the 25 MB limit")
+
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(data)
+            tmp_path = tmp.name
+        try:
+            text = transcribe_audio_file(tmp_path, model_name, language)
+        except ValueError as e:
+            return openai_error(400, str(e))
+        except Exception as e:  # model load/download or decode failure
+            return openai_error(503, f"Transcription failed: {e}", err_type="service_unavailable")
+        finally:
+            os.unlink(tmp_path)
+        return {"text": text}
 
 
 if __name__ == "__main__":

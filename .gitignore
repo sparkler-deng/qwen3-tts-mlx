@@ -24,3 +24,6 @@ reference_voices/
 # Environment files
 .env
 .env.local
+
+# Browser-test artifacts
+.playwright-mcp/
